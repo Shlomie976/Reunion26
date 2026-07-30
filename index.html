@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>Who Said It? — Family Edition</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700;9..144,900&family=Space+Mono:wght@400;700&family=Nunito+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Nunito Sans', sans-serif;
+    background: #16333A;
+    background-image:
+      radial-gradient(circle at 15% 10%, rgba(237,163,59,0.10) 0%, transparent 45%),
+      radial-gradient(circle at 85% 90%, rgba(226,88,62,0.10) 0%, transparent 45%);
+    min-height: 100vh;
+    color: #FBF3E4;
+  }
+  .disp { font-family: 'Fraunces', serif; }
+  .mono { font-family: 'Space Mono', monospace; }
+  @keyframes floatIn { from { opacity: 0; transform: translateY(10px);} to { opacity: 1; transform: translateY(0);} }
+  @keyframes pop { 0% { transform: scale(0.85); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+  .anim-in { animation: floatIn 0.35s ease both; }
+  .anim-pop { animation: pop 0.3s cubic-bezier(.2,1.4,.4,1) both; }
+  .ticket { position: relative; background: #FBF3E4; color: #16333A; border-radius: 16px; }
+  .ticket::before, .ticket::after {
+    content: ""; position: absolute; width: 22px; height: 22px; background: #16333A;
+    border-radius: 50%; top: 50%; transform: translateY(-50%);
+  }
+  .ticket::before { left: -11px; }
+  .ticket::after { right: -11px; }
+  .scrollbar-none::-webkit-scrollbar { display: none; }
+  button { font-family: inherit; }
+  input, textarea { font-family: inherit; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible {
+    outline: 3px solid #EDA33B; outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .anim-in, .anim-pop { animation: none !important; }
+  }
+  #root { max-width: 480px; margin: 0 auto; min-height: 100vh; padding: 24px 16px 60px; display: flex; flex-direction: column; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---------- kvdb.io storage layer (free, no-signup, public key-value store) ----------
+// Each game creates its own "bucket" on kvdb.io the moment it's hosted, and stores
+// a single JSON key called "room" inside it. The bucket ID doubles as the shareable
+// game code. Because kvdb.io buckets are unauthenticated by default, anyone with the
+// link can read/write that game's data -- fine for a casual family game, not for
+// anything sensitive.
+const KV_BASE = "https://kvdb.io";
+
+async function kvCreateBucket() {
+  const res = await fetch(KV_BASE + "/", { method: "POST" });
+  if (!res.ok) throw new Error("Couldn't reach the game server (status " + res.status + ").");
+  const id = (await res.text()).trim();
+  if (!id) throw new Error("Game server didn't return a game code.");
+  return id;
+}
+async function kvGet(bucket, key) {
+  const res = await fetch(`${KV_BASE}/${bucket}/${key}`, { cache: "no-store" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Couldn't load the game (status " + res.status + ").");
+  const text = await res.text();
+  if (!text) return null;
+  return JSON.parse(text);
+}
+async function kvSet(bucket, key, value) {
+  const res = await fetch(`${KV_BASE}/${bucket}/${key}`, {
+    method: "PUT",
+    body: JSON.stringify(value),
+  });
+  if (!res.ok) throw new Error("Couldn't save to the game (status " + res.status + ").");
+  return true;
+}
+
+async function readRoom(code) {
+  try {
+    return await kvGet(code, "room");
+  } catch (e) {
+    console.error(e);
+    return null;
+  }
+}
+async function writeRoom(code, data) {
+  return kvSet(code, "room", data);
+}
+// read-modify-write to reduce clobbering concurrent updates
+async function updateRoom(code, updater) {
+  const current = await readRoom(code);
+  if (!current) return null;
+  const next = updater(current);
+  if (!next) return current;
+  next.updatedAt = Date.now();
+  try {
+    await writeRoom(code, next);
+  } catch (e) {
+    console.error("updateRoom write failed:", e);
+    return null;
+  }
+  return next;
+}
+
+function makeId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+const DEFAULT_PROMPTS = [
+  "What's the most embarrassing thing that's happened to you at a family gathering?",
+  "What food do you pretend to love at family dinners but secretly can't stand?",
+  "What's the weirdest gift a relative has ever given you?",
+  "If you could permanently retire one family tradition, which would it be?",
+  "What's your go-to excuse for leaving a family event early?",
+  "What's the last little lie you told a family member?",
+  "What childhood nickname do you secretly hate?",
+  "What's the most trouble you ever got into as a kid?",
+  "What's something about you that would genuinely shock your grandparents?",
+  "What's your most irrational fear?",
+  "What's a weird food combination you actually love?",
+  "What talent do you have that almost nobody in the family knows about?",
+  "What's the pettiest thing you've ever argued with a sibling or cousin about?",
+  "What's one household chore you'd rather die than do?",
+  "If the family had a theme song, what would you title it?",
+];
+
+const AVATAR_COLORS = ["#EDA33B", "#E2583E", "#8FA998", "#7D9BC1", "#C97BB0", "#E0B84F"];
+function colorForPlayer(id, players) {
+  const idx = players.findIndex((p) => p.id === id);
+  return AVATAR_COLORS[idx % AVATAR_COLORS.length];
+}
+
+function newRoomState(code, hostName, hostId) {
+  return {
+    code, phase: "lobby", hostId,
+    players: [{ id: hostId, name: hostName, score: 0 }],
+    prompts: DEFAULT_PROMPTS.slice(), roundCount: 8, roundIndex: -1,
+    usedTruthTellers: [], currentPrompt: null, truthTellerId: null,
+    answers: {}, votes: {}, lastRoundResult: null,
+    createdAt: Date.now(), updatedAt: Date.now(),
+  };
+}
+
+// ---------- UI atoms ----------
+function Avatar({ name, color, size = 40 }) {
+  const initial = (name || "?").trim().charAt(0).toUpperCase();
+  return (
+    <div className="disp" style={{
+      width: size, height: size, borderRadius: "50%", background: color,
+      display: "flex", alignItems: "center", justifyContent: "center",
+      color: "#16333A", fontWeight: 800, fontSize: size * 0.42, flexShrink: 0,
+      boxShadow: "0 2px 0 rgba(0,0,0,0.25)",
+    }}>{initial}</div>
+  );
+}
+function PrimaryButton({ children, onClick, disabled, style }) {
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      background: disabled ? "#5c6d68" : "#E2583E", color: "#FBF3E4", border: "none",
+      borderRadius: 14, padding: "14px 22px", fontSize: 17, fontWeight: 800,
+      cursor: disabled ? "not-allowed" : "pointer", display: "flex", alignItems: "center",
+      justifyContent: "center", gap: 8, boxShadow: disabled ? "none" : "0 4px 0 #a83c28",
+      width: "100%", ...style,
+    }}>{children}</button>
+  );
+}
+function GhostButton({ children, onClick, style }) {
+  return (
+    <button onClick={onClick} style={{
+      background: "transparent", color: "#FBF3E4", border: "2px solid rgba(251,243,228,0.35)",
+      borderRadius: 14, padding: "12px 20px", fontSize: 15, fontWeight: 700, cursor: "pointer",
+      display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", ...style,
+    }}>{children}</button>
+  );
+}
+function Card({ children, style }) {
+  return (
+    <div className="anim-in" style={{ background: "#1E4552", borderRadius: 18, padding: 20, border: "1px solid rgba(251,243,228,0.08)", ...style }}>
+      {children}
+    </div>
+  );
+}
+
+// ---------- Main App ----------
+function App() {
+  const params = new URLSearchParams(window.location.search);
+  const codeFromLink = (params.get("game") || "").trim();
+
+  const [screen, setScreen] = useState("home");
+  const [room, setRoom] = useState(null);
+  const [code, setCode] = useState(codeFromLink);
+  const [name, setName] = useState("");
+  const [myId, setMyId] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const pollRef = useRef(null);
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+
+  const startPolling = useCallback((roomCode) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      const r = await readRoom(roomCode);
+      if (r) setRoom(r);
+    }, 2000);
+  }, []);
+
+  useEffect(() => {
+    if (codeFromLink) setScreen("join");
+  }, []); // eslint-disable-line
+
+  async function handleCreate() {
+    if (!name.trim()) { setError("Enter your name first."); return; }
+    setBusy(true); setError("");
+    let newCode;
+    try {
+      newCode = await kvCreateBucket();
+    } catch (e) {
+      setBusy(false);
+      setError("Couldn't create the game: " + (e?.message || "unknown error"));
+      return;
+    }
+    const hostId = makeId();
+    const state = newRoomState(newCode, name.trim(), hostId);
+    try {
+      await writeRoom(newCode, state);
+    } catch (e) {
+      setBusy(false);
+      setError("Couldn't create the game: " + (e?.message || "unknown error"));
+      return;
+    }
+    setBusy(false);
+    setMyId(hostId);
+    setRoom(state);
+    setCode(newCode);
+    setScreen("game");
+    startPolling(newCode);
+    const url = new URL(window.location.href);
+    url.searchParams.set("game", newCode);
+    window.history.replaceState({}, "", url);
+  }
+
+  async function handleJoin() {
+    if (!name.trim()) { setError("Enter your name first."); return; }
+    const roomCode = code.trim();
+    if (!roomCode) { setError("Enter the game code or use the link the host sent you."); return; }
+    setBusy(true); setError("");
+    const existing = await readRoom(roomCode);
+    if (!existing) { setBusy(false); setError("No game found with that code. Double check the link or code."); return; }
+    if (existing.phase !== "lobby") { setBusy(false); setError("That game already started."); return; }
+    const pid = makeId();
+    const updated = await updateRoom(roomCode, (r) => { r.players.push({ id: pid, name: name.trim(), score: 0 }); return r; });
+    setBusy(false);
+    if (!updated) { setError("Couldn't join. Try again."); return; }
+    setMyId(pid);
+    setRoom(updated);
+    setCode(roomCode);
+    setScreen("game");
+    startPolling(roomCode);
+  }
+
+  function leaveGame() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    setScreen("home"); setRoom(null); setMyId(null); setCode(""); setError("");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("game");
+    window.history.replaceState({}, "", url);
+  }
+
+  return (
+    <React.Fragment>
+      {screen === "home" && <Home onCreate={() => setScreen("create")} onJoin={() => setScreen("join")} />}
+      {screen === "create" && (
+        <AuthForm title="Start a family game" subtitle="Everyone joins from their own phone with a link."
+          name={name} setName={setName} primaryLabel="Create game" onPrimary={handleCreate}
+          onBack={() => { setScreen("home"); setError(""); }} busy={busy} error={error} />
+      )}
+      {screen === "join" && (
+        <AuthForm title="Join the game" subtitle={codeFromLink ? "You're joining via the link the host sent." : "Ask the host for their game link or code."}
+          name={name} setName={setName} code={code} setCode={setCode} showCode={!codeFromLink}
+          primaryLabel="Join game" onPrimary={handleJoin} onBack={() => { setScreen("home"); setError(""); }} busy={busy} error={error} />
+      )}
+      {screen === "game" && room && myId && <GameScreen room={room} setRoom={setRoom} code={code} myId={myId} onLeave={leaveGame} />}
+    </React.Fragment>
+  );
+}
+
+function Home({ onCreate, onJoin }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, justifyContent: "center", gap: 28 }}>
+      <div className="anim-in" style={{ textAlign: "center" }}>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
+          <div className="ticket" style={{ padding: "8px 20px", transform: "rotate(-3deg)" }}>
+            <span className="mono" style={{ fontWeight: 700, letterSpacing: 2, fontSize: 13 }}>FAMILY EDITION</span>
+          </div>
+        </div>
+        <h1 className="disp" style={{ fontSize: 50, fontWeight: 900, margin: "6px 0", lineHeight: 1.02 }}>Who Said It?</h1>
+        <p style={{ opacity: 0.8, fontSize: 16, margin: 0 }}>One truth. A room full of bluffs. Can you spot family?</p>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <PrimaryButton onClick={onCreate}>✨ Host a new game</PrimaryButton>
+        <GhostButton onClick={onJoin}>👥 Join with a code</GhostButton>
+      </div>
+      <p style={{ textAlign: "center", fontSize: 13, opacity: 0.55, marginTop: 4 }}>Everyone plays from their own phone.</p>
+    </div>
+  );
+}
+
+function AuthForm({ title, subtitle, name, setName, code, setCode, showCode, primaryLabel, onPrimary, onBack, busy, error }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, justifyContent: "center", gap: 18 }} className="anim-in">
+      <button onClick={onBack} style={{ background: "none", border: "none", color: "#FBF3E4", opacity: 0.6, textAlign: "left", padding: 0, cursor: "pointer", fontSize: 14 }}>← back</button>
+      <div>
+        <h2 className="disp" style={{ fontSize: 30, fontWeight: 800, margin: "0 0 4px" }}>{title}</h2>
+        <p style={{ opacity: 0.7, margin: 0, fontSize: 15 }}>{subtitle}</p>
+      </div>
+      {showCode && (
+        <div>
+          <label style={{ fontSize: 13, opacity: 0.7, fontWeight: 700 }}>GAME CODE</label>
+          <input value={code} onChange={(e) => setCode(e.target.value.trim())} placeholder="Paste code here"
+            className="mono" style={{ width: "100%", padding: "14px 16px", fontSize: 16, borderRadius: 12, border: "2px solid rgba(251,243,228,0.25)", background: "rgba(251,243,228,0.06)", color: "#FBF3E4", marginTop: 6 }} />
+        </div>
+      )}
+      <div>
+        <label style={{ fontSize: 13, opacity: 0.7, fontWeight: 700 }}>YOUR NAME</label>
+        <input value={name} onChange={(e) => setName(e.target.value.slice(0, 20))} placeholder="e.g. Aunt Carol"
+          style={{ width: "100%", padding: "14px 16px", fontSize: 17, borderRadius: 12, border: "2px solid rgba(251,243,228,0.25)", background: "rgba(251,243,228,0.06)", color: "#FBF3E4", marginTop: 6 }} />
+      </div>
+      {error && <p style={{ color: "#F2A9A9", fontSize: 14, margin: 0 }}>{error}</p>}
+      <PrimaryButton onClick={onPrimary} disabled={busy}>{busy ? "..." : primaryLabel}</PrimaryButton>
+    </div>
+  );
+}
+
+function GameScreen({ room, setRoom, code, myId, onLeave }) {
+  const isHost = room.hostId === myId;
+  const me = room.players.find((p) => p.id === myId);
+  if (!me) {
+    return (
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", gap: 16 }}>
+        <p>You've been removed from this game or it ended.</p>
+        <PrimaryButton onClick={onLeave}>Back home</PrimaryButton>
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, gap: 16 }}>
+      <TopBar room={room} onLeave={onLeave} />
+      {room.phase === "lobby" && <Lobby room={room} code={code} myId={myId} isHost={isHost} onUpdate={setRoom} />}
+      {room.phase === "answering" && <Answering room={room} code={code} myId={myId} isHost={isHost} onUpdate={setRoom} />}
+      {room.phase === "voting" && <Voting room={room} code={code} myId={myId} isHost={isHost} onUpdate={setRoom} />}
+      {room.phase === "reveal" && <Reveal room={room} code={code} myId={myId} isHost={isHost} onUpdate={setRoom} />}
+      {room.phase === "gameover" && <GameOver room={room} code={code} myId={myId} isHost={isHost} onLeave={onLeave} onUpdate={setRoom} />}
+    </div>
+  );
+}
+
+function TopBar({ room, onLeave }) {
+  const roundLabel = (room.phase === "lobby" || room.phase === "gameover") ? null : `Round ${room.roundIndex + 1} / ${room.roundCount}`;
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <button onClick={onLeave} style={{ background: "none", border: "none", color: "#FBF3E4", opacity: 0.6, cursor: "pointer", fontSize: 13 }}>Leave</button>
+      <div className="mono" style={{ fontSize: 12, opacity: 0.6, letterSpacing: 1 }}>{roundLabel || `Code: ${room.code}`}</div>
+    </div>
+  );
+}
+
+function Lobby({ room, code, myId, isHost, onUpdate }) {
+  const [editingPrompts, setEditingPrompts] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const shareUrl = (() => { const u = new URL(window.location.href); u.searchParams.set("game", code); return u.toString(); })();
+
+  function copyLink() {
+    if (navigator.clipboard) navigator.clipboard.writeText(shareUrl);
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
+  }
+  async function startGame() {
+    if (room.players.length < 3) return;
+    setStarting(true);
+    const updated = await updateRoom(code, (r) => beginRound(r));
+    if (updated) onUpdate(updated);
+    setStarting(false);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div className="ticket anim-pop" style={{ padding: "20px 16px", textAlign: "center" }}>
+        <div className="mono" style={{ fontSize: 12, fontWeight: 700, opacity: 0.6, letterSpacing: 2 }}>SHARE THIS LINK</div>
+        <div className="mono" style={{ fontSize: 13, wordBreak: "break-all", margin: "8px 0" }}>{shareUrl}</div>
+        <button onClick={copyLink} style={{ border: "none", background: "#16333A", color: "#FBF3E4", borderRadius: 10, padding: "8px 16px", fontSize: 13, cursor: "pointer", fontWeight: 700 }}>
+          {copied ? "Copied!" : "Copy link"}
+        </button>
+      </div>
+
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <span style={{ fontWeight: 800 }}>👥 {room.players.length} joined</span>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {room.players.map((p) => (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Avatar name={p.name} color={colorForPlayer(p.id, room.players)} size={34} />
+              <span style={{ fontWeight: 600 }}>{p.name}</span>
+              {p.id === room.hostId && <span title="Host">👑</span>}
+              {p.id === myId && <span style={{ opacity: 0.5, fontSize: 12 }}>(you)</span>}
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {isHost && (
+        <Card>
+          <button onClick={() => setEditingPrompts((v) => !v)} style={{ background: "none", border: "none", color: "#FBF3E4", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%" }}>
+            <span style={{ fontWeight: 800 }}>Prompts ({room.prompts.length}) — make them yours</span>
+            <span style={{ opacity: 0.6, fontSize: 13 }}>{editingPrompts ? "hide" : "edit"}</span>
+          </button>
+          {editingPrompts && <PromptEditor room={room} code={code} onUpdate={onUpdate} />}
+        </Card>
+      )}
+
+      {isHost ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <PrimaryButton onClick={startGame} disabled={room.players.length < 3 || starting}>
+            {room.players.length < 3 ? "Need at least 3 players" : starting ? "Starting..." : "✨ Start game"}
+          </PrimaryButton>
+          <p style={{ textAlign: "center", fontSize: 12, opacity: 0.5, margin: 0 }}>Players can join right up until you start.</p>
+        </div>
+      ) : (
+        <p style={{ textAlign: "center", opacity: 0.7 }}>Waiting for the host to start the game…</p>
+      )}
+    </div>
+  );
+}
+
+function PromptEditor({ room, code, onUpdate }) {
+  const [draft, setDraft] = useState("");
+  const [rounds, setRounds] = useState(room.roundCount);
+  async function addPrompt() {
+    if (!draft.trim()) return;
+    const updated = await updateRoom(code, (r) => { r.prompts.push(draft.trim()); return r; });
+    if (updated) onUpdate(updated);
+    setDraft("");
+  }
+  async function removePrompt(idx) {
+    const updated = await updateRoom(code, (r) => { r.prompts.splice(idx, 1); return r; });
+    if (updated) onUpdate(updated);
+  }
+  async function resetPrompts() {
+    const updated = await updateRoom(code, (r) => { r.prompts = DEFAULT_PROMPTS.slice(); return r; });
+    if (updated) onUpdate(updated);
+  }
+  async function applyRounds() {
+    const n = Math.max(1, Math.min(room.prompts.length, Number(rounds) || 1));
+    const updated = await updateRoom(code, (r) => { r.roundCount = n; return r; });
+    if (updated) onUpdate(updated);
+  }
+  return (
+    <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div className="scrollbar-none" style={{ maxHeight: 220, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+        {room.prompts.map((p, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, background: "rgba(251,243,228,0.06)", borderRadius: 10, padding: "8px 10px" }}>
+            <span style={{ flex: 1, fontSize: 14 }}>{p}</span>
+            <button onClick={() => removePrompt(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#F2A9A9", flexShrink: 0 }}>✕</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Add a family-specific prompt…"
+          style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: "2px solid rgba(251,243,228,0.2)", background: "rgba(251,243,228,0.06)", color: "#FBF3E4", fontSize: 14 }} />
+        <button onClick={addPrompt} style={{ background: "#EDA33B", border: "none", borderRadius: 10, width: 42, cursor: "pointer", color: "#16333A", fontWeight: 800 }}>+</button>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+        <label style={{ fontSize: 13, opacity: 0.7 }}>Rounds to play:</label>
+        <input type="number" min={1} max={room.prompts.length} value={rounds} onChange={(e) => setRounds(e.target.value)} onBlur={applyRounds}
+          style={{ width: 56, padding: "6px 8px", borderRadius: 8, border: "2px solid rgba(251,243,228,0.2)", background: "rgba(251,243,228,0.06)", color: "#FBF3E4" }} />
+        <button onClick={resetPrompts} style={{ marginLeft: "auto", background: "none", border: "none", color: "#FBF3E4", opacity: 0.6, fontSize: 12, cursor: "pointer" }}>↺ reset defaults</button>
+      </div>
+    </div>
+  );
+}
+
+function beginRound(r) {
+  const nextIndex = r.roundIndex + 1;
+  if (nextIndex >= r.roundCount || nextIndex >= r.prompts.length) return r;
+  const remaining = r.players.filter((p) => !r.usedTruthTellers.includes(p.id));
+  const pool = remaining.length > 0 ? remaining : r.players;
+  const teller = pool[Math.floor(Math.random() * pool.length)];
+  r.roundIndex = nextIndex;
+  r.currentPrompt = r.prompts[nextIndex];
+  r.truthTellerId = teller.id;
+  r.usedTruthTellers = remaining.length > 0 ? [...r.usedTruthTellers, teller.id] : [teller.id];
+  r.answers = {}; r.votes = {}; r.lastRoundResult = null;
+  r.phase = "answering";
+  return r;
+}
+
+function Answering({ room, code, myId, isHost, onUpdate }) {
+  const [text, setText] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const isTeller = room.truthTellerId === myId;
+  const submittedCount = Object.keys(room.answers).length;
+  const totalNeeded = room.players.length;
+
+  useEffect(() => { setSubmitted(!!room.answers[myId]); }, [room.answers, myId]);
+
+  async function submit() {
+    if (!text.trim()) return;
+    const updated = await updateRoom(code, (r) => { r.answers[myId] = text.trim(); return r; });
+    if (updated) onUpdate(updated);
+    setSubmitted(true);
+  }
+  async function forceAdvance() {
+    const updated = await updateRoom(code, (r) => {
+      r.players.forEach((p) => { if (!r.answers[p.id]) r.answers[p.id] = "(no answer)"; });
+      r.phase = "voting"; return r;
+    });
+    if (updated) onUpdate(updated);
+  }
+  const tellerName = room.players.find((p) => p.id === room.truthTellerId)?.name;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card style={{ background: isTeller ? "#3B5E43" : "#1E4552" }}>
+        <div className="mono" style={{ fontSize: 12, opacity: 0.7, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>
+          {isTeller ? "YOU'RE THE ANSWERER" : `${tellerName} IS ANSWERING FOR REAL`}
+        </div>
+        <div className="disp" style={{ fontSize: 22, fontWeight: 700, lineHeight: 1.3 }}>{room.currentPrompt}</div>
+      </Card>
+      {!submitted ? (
+        <Card>
+          <p style={{ margin: "0 0 10px", fontSize: 14, opacity: 0.8 }}>
+            {isTeller ? "Answer honestly — everyone else is about to try and copy your vibe." : "Write a convincing fake answer to blend in with the truth."}
+          </p>
+          <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder={isTeller ? "Your true answer…" : "Your bluff…"} rows={3}
+            style={{ width: "100%", padding: 12, borderRadius: 12, border: "2px solid rgba(251,243,228,0.2)", background: "rgba(251,243,228,0.06)", color: "#FBF3E4", fontSize: 15, resize: "none" }} />
+          <div style={{ marginTop: 10 }}><PrimaryButton onClick={submit} disabled={!text.trim()}>Submit</PrimaryButton></div>
+        </Card>
+      ) : (
+        <Card style={{ textAlign: "center" }}>
+          <div>✓</div>
+          <p style={{ margin: "8px 0 0" }}>Answer locked in. Waiting on {totalNeeded - submittedCount} more…</p>
+        </Card>
+      )}
+      <PlayerChecklist room={room} statusMap={room.answers} />
+      {isHost && submittedCount < totalNeeded && <GhostButton onClick={forceAdvance}>Skip stragglers &amp; move to voting</GhostButton>}
+      {isHost && submittedCount >= totalNeeded && (
+        <PrimaryButton onClick={async () => { const updated = await updateRoom(code, (r) => { r.phase = "voting"; return r; }); if (updated) onUpdate(updated); }}>
+          Everyone's in — start voting
+        </PrimaryButton>
+      )}
+    </div>
+  );
+}
+
+function PlayerChecklist({ room, statusMap }) {
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+      {room.players.map((p) => (
+        <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(251,243,228,0.06)", borderRadius: 20, padding: "4px 10px 4px 4px", opacity: statusMap[p.id] ? 1 : 0.45 }}>
+          <Avatar name={p.name} color={colorForPlayer(p.id, room.players)} size={22} />
+          <span style={{ fontSize: 12, fontWeight: 700 }}>{p.name}</span>
+          {statusMap[p.id] && <span>✓</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function useShuffledOnce(entries, roundIndex) {
+  const ref = useRef({ round: null, key: null, order: [] });
+  const key = entries.map(([id]) => id).sort().join(",");
+  if (ref.current.round !== roundIndex || ref.current.key !== key) {
+    const shuffled = [...entries].sort(() => Math.random() - 0.5);
+    ref.current = { round: roundIndex, key, order: shuffled };
+  }
+  return ref.current.order;
+}
+
+function Voting({ room, code, myId, isHost, onUpdate }) {
+  const isTeller = room.truthTellerId === myId;
+  const myVote = room.votes[myId];
+  const entries = Object.entries(room.answers);
+  const shuffled = useShuffledOnce(entries, room.roundIndex);
+  const voteCount = Object.keys(room.votes).length;
+  const votersNeeded = room.players.length - 1;
+
+  async function vote(targetId) {
+    if (isTeller || myVote || targetId === myId) return;
+    const updated = await updateRoom(code, (r) => { r.votes[myId] = targetId; return r; });
+    if (updated) onUpdate(updated);
+  }
+  async function forceReveal() {
+    const updated = await updateRoom(code, (r) => { r.phase = "reveal"; r.lastRoundResult = computeRoundResult(r); return r; });
+    if (updated) onUpdate(updated);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div className="mono" style={{ fontSize: 12, opacity: 0.7, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>WHO'S TELLING THE TRUTH?</div>
+        <div className="disp" style={{ fontSize: 20, fontWeight: 700, lineHeight: 1.3 }}>{room.currentPrompt}</div>
+      </Card>
+      {isTeller ? (
+        <Card style={{ textAlign: "center" }}><p style={{ margin: 0, opacity: 0.85 }}>You already answered honestly — sit back and watch everyone try to catch you.</p></Card>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {shuffled.map(([pid, text]) => (
+            <button key={pid} onClick={() => vote(pid)} disabled={pid === myId || !!myVote} className="anim-in" style={{
+              textAlign: "left", padding: 16, borderRadius: 14,
+              border: myVote === pid ? "2px solid #EDA33B" : "2px solid rgba(251,243,228,0.15)",
+              background: pid === myId ? "rgba(251,243,228,0.03)" : "#1E4552", color: "#FBF3E4",
+              cursor: pid === myId || myVote ? "default" : "pointer", fontSize: 15, opacity: pid === myId ? 0.5 : 1, position: "relative",
+            }}>
+              {text}
+              {pid === myId && <div style={{ fontSize: 11, opacity: 0.7, marginTop: 6 }}>— your answer</div>}
+              {myVote === pid && <div style={{ position: "absolute", top: 10, right: 10 }}>✓</div>}
+            </button>
+          ))}
+        </div>
+      )}
+      {myVote && !isTeller && <p style={{ textAlign: "center", opacity: 0.7, fontSize: 14 }}>Vote locked. Waiting on the rest of the family…</p>}
+      <div style={{ display: "flex", justifyContent: "center", fontSize: 13, opacity: 0.6 }}>{voteCount}/{votersNeeded} voted</div>
+      {isHost && <PrimaryButton onClick={forceReveal}>{voteCount >= votersNeeded ? "Reveal the truth" : "Reveal now (skip stragglers)"}</PrimaryButton>}
+    </div>
+  );
+}
+
+function computeRoundResult(r) {
+  const truthId = r.truthTellerId;
+  const fooledCounts = {};
+  const truthGuessers = [];
+  Object.entries(r.votes).forEach(([voterId, targetId]) => {
+    if (targetId === truthId) truthGuessers.push(voterId);
+    else fooledCounts[targetId] = (fooledCounts[targetId] || 0) + 1;
+  });
+  const pointsAwarded = {};
+  truthGuessers.forEach((vid) => { pointsAwarded[vid] = (pointsAwarded[vid] || 0) + 1000; });
+  Object.entries(fooledCounts).forEach(([bluffer, count]) => { pointsAwarded[bluffer] = (pointsAwarded[bluffer] || 0) + count * 500; });
+  const votersTotal = Object.keys(r.votes).length;
+  const stumpBonus = votersTotal > 0 && truthGuessers.length === 0 ? 250 * votersTotal : 0;
+  if (stumpBonus) pointsAwarded[truthId] = (pointsAwarded[truthId] || 0) + stumpBonus;
+  r.players.forEach((p) => { if (pointsAwarded[p.id]) p.score += pointsAwarded[p.id]; });
+  return { truthId, fooledCounts, truthGuessers, pointsAwarded, stumpBonus };
+}
+
+function Reveal({ room, code, myId, isHost, onUpdate }) {
+  const result = room.lastRoundResult || computeRoundResult({ ...room, players: room.players.map((p) => ({ ...p })) });
+  const truthPlayer = room.players.find((p) => p.id === result.truthId);
+  const entries = Object.entries(room.answers);
+  const isLastRound = room.roundIndex + 1 >= room.roundCount || room.roundIndex + 1 >= room.prompts.length;
+  async function nextRound() {
+    const updated = await updateRoom(code, (r) => { if (isLastRound) { r.phase = "gameover"; return r; } return beginRound(r); });
+    if (updated) onUpdate(updated);
+  }
+  const sortedPlayers = [...room.players].sort((a, b) => b.score - a.score);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card style={{ background: "#3B5E43" }} className="anim-pop">
+        <div className="mono" style={{ fontSize: 12, opacity: 0.75, fontWeight: 700, letterSpacing: 1, marginBottom: 6 }}>THE TRUTH</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <Avatar name={truthPlayer?.name} color={colorForPlayer(result.truthId, room.players)} size={30} />
+          <span style={{ fontWeight: 800 }}>{truthPlayer?.name}</span>
+        </div>
+        <div style={{ fontSize: 16 }}>{room.answers[result.truthId]}</div>
+        {result.stumpBonus > 0 && <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>😲 Stumped everyone — bonus points!</div>}
+      </Card>
+      <Card>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Everyone's answers</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {entries.map(([pid, text]) => {
+            const player = room.players.find((p) => p.id === pid);
+            const isTruth = pid === result.truthId;
+            const votesReceived = Object.values(room.votes).filter((v) => v === pid).length;
+            return (
+              <div key={pid} style={{ padding: 12, borderRadius: 12, background: isTruth ? "rgba(143,169,152,0.18)" : "rgba(251,243,228,0.05)", border: isTruth ? "1px solid #8FA998" : "1px solid transparent" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <Avatar name={player?.name} color={colorForPlayer(pid, room.players)} size={22} />
+                  <span style={{ fontWeight: 700, fontSize: 13 }}>{player?.name}</span>
+                  {isTruth && <span style={{ fontSize: 11, background: "#8FA998", color: "#16333A", borderRadius: 8, padding: "1px 6px", fontWeight: 800 }}>TRUTH</span>}
+                  {!isTruth && votesReceived > 0 && <span style={{ fontSize: 11, opacity: 0.7 }}>fooled {votesReceived}</span>}
+                  {(result.pointsAwarded[pid] || 0) > 0 && <span style={{ marginLeft: "auto", fontSize: 12, fontWeight: 800, color: "#EDA33B" }}>+{result.pointsAwarded[pid]}</span>}
+                </div>
+                <div style={{ fontSize: 14, opacity: 0.9 }}>{text}</div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+      <Card>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Scoreboard</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {sortedPlayers.map((p, i) => (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span className="mono" style={{ width: 18, opacity: 0.5, fontSize: 13 }}>{i + 1}</span>
+              <Avatar name={p.name} color={colorForPlayer(p.id, room.players)} size={26} />
+              <span style={{ fontWeight: 600, flex: 1 }}>{p.name}{p.id === myId && " (you)"}</span>
+              <span className="mono" style={{ fontWeight: 800 }}>{p.score}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+      {isHost && <PrimaryButton onClick={nextRound}>{isLastRound ? "See final results" : "Next round"}</PrimaryButton>}
+      {!isHost && <p style={{ textAlign: "center", opacity: 0.6, fontSize: 13 }}>Waiting for the host to continue…</p>}
+    </div>
+  );
+}
+
+function GameOver({ room, onLeave, code, isHost, onUpdate }) {
+  const sorted = [...room.players].sort((a, b) => b.score - a.score);
+  const winner = sorted[0];
+  async function playAgain() {
+    const updated = await updateRoom(code, (r) => {
+      r.phase = "lobby"; r.roundIndex = -1; r.usedTruthTellers = []; r.currentPrompt = null; r.truthTellerId = null;
+      r.answers = {}; r.votes = {}; r.lastRoundResult = null; r.players.forEach((p) => { p.score = 0; });
+      return r;
+    });
+    if (updated) onUpdate(updated);
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <div className="anim-pop" style={{ textAlign: "center", marginTop: 10 }}>
+        <div style={{ fontSize: 44 }}>🏆</div>
+        <h2 className="disp" style={{ fontSize: 30, fontWeight: 900, margin: "8px 0 2px" }}>{winner?.name} wins!</h2>
+        <p style={{ opacity: 0.7, margin: 0 }}>{winner?.score} points</p>
+      </div>
+      <Card>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {sorted.map((p, i) => (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span className="mono" style={{ width: 18, opacity: 0.5 }}>{i + 1}</span>
+              <Avatar name={p.name} color={colorForPlayer(p.id, room.players)} size={30} />
+              <span style={{ fontWeight: 700, flex: 1 }}>{p.name}</span>
+              <span className="mono" style={{ fontWeight: 800 }}>{p.score}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+      {isHost ? <PrimaryButton onClick={playAgain}>🔀 Play again</PrimaryButton> : <p style={{ textAlign: "center", opacity: 0.6, fontSize: 13 }}>Waiting for the host to start a new round…</p>}
+      <GhostButton onClick={onLeave}>Leave game</GhostButton>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
